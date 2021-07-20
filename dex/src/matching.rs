@@ -141,6 +141,30 @@ impl<'ob> OrderBookState<'ob> {
             }
         })
     }
+
+    // Removes all orders belonging to the given open orders account.
+    pub fn prune(&mut self, open_orders: [u64; 4]) -> DexResult<usize> {
+        let asks_matching_open_orders = self.asks.find_by(|order| order.owner().eq(&open_orders));
+        let bids_matching_open_orders = self.bids.find_by(|order| order.owner().eq(&open_orders));
+        let asks_removed: Vec<Option<LeafNode>> = asks_matching_open_orders
+            .iter()
+            .map(|order_to_remove| self.asks.remove_by_key(*order_to_remove))
+            .filter(|node| node.is_some())
+            .collect();
+        let bids_removed: Vec<Option<LeafNode>> = bids_matching_open_orders
+            .iter()
+            .map(|order_to_remove| self.bids.remove_by_key(*order_to_remove))
+            .filter(|node| node.is_some())
+            .collect();
+
+        msg!(
+            "Pruned {} asks and {} bids",
+            asks_removed.len(),
+            bids_removed.len()
+        );
+
+        Ok(asks_removed.len() + bids_removed.len())
+    }
 }
 
 pub(crate) struct RequestProceeds {

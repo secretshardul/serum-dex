@@ -107,6 +107,13 @@ impl<'a> Market<'a> {
         }
     }
 
+    pub fn prune_authority(&self) -> Option<&Pubkey> {
+        match &self {
+            Market::V1(_) => None,
+            Market::V2(state) => Some(&state.prune_authority),
+        }
+    }
+
     pub fn load_orders_mut(
         &self,
         orders_account: &'a AccountInfo,
@@ -158,6 +165,7 @@ impl<'a> Market<'a> {
 pub struct MarketStateV2 {
     pub inner: MarketState,
     pub authority: Pubkey,
+    pub prune_authority: Pubkey,
 }
 
 impl Deref for MarketStateV2 {
@@ -1521,6 +1529,7 @@ pub(crate) mod account_parser {
         pub coin_vault_and_mint: TokenAccountAndMint<'a, 'b>,
         pub pc_vault_and_mint: TokenAccountAndMint<'a, 'b>,
         pub market_authority: Option<&'a AccountInfo<'b>>,
+        pub prune_authority: Option<&'a AccountInfo<'b>>,
     }
 
     impl<'a, 'b: 'a> InitializeMarketArgs<'a, 'b> {
@@ -1538,7 +1547,14 @@ pub(crate) mod account_parser {
                 remaining_accounts,
             ) = array_refs![accounts, 5, 2, 2, 1; .. ;];
 
-            let market_authority = remaining_accounts.first();
+            let (market_authority, prune_authority) = {
+                let first = remaining_accounts.first();
+                if first.is_none() {
+                    (None, None)
+                } else {
+                    (first, remaining_accounts.first())
+                }
+            };
 
             {
                 let rent_sysvar = RentSysvarAccount::new(&unchecked_rent[0])?;
@@ -1596,6 +1612,7 @@ pub(crate) mod account_parser {
                 coin_vault_and_mint,
                 pc_vault_and_mint,
                 market_authority,
+                prune_authority,
             })
         }
 
@@ -2220,6 +2237,55 @@ pub(crate) mod account_parser {
             f(InitOpenOrdersArgs)
         }
     }
+
+    pub struct PruneArgs<'a> {
+        pub order_book_state: OrderBookState<'a>,
+        pub open_orders: &'a Pubkey,
+    }
+
+    impl<'a> PruneArgs<'a> {
+        pub fn with_parsed_args<T>(
+            program_id: &Pubkey,
+            accounts: &[AccountInfo],
+            f: impl FnOnce(PruneArgs) -> DexResult<T>,
+        ) -> DexResult<T> {
+            // Parse accounts.
+            check_assert!(accounts.len() == 6)?;
+            #[rustfmt::skip]
+            let &[
+                ref market_acc,
+                ref bids_acc,
+                ref asks_acc,
+                ref prune_auth_acc,
+                ref open_orders_acc,
+                ref open_orders_owner_acc,
+            ] = array_ref![accounts, 0, 6];
+
+            let _prune_authority = SignerAccount::new(prune_auth_acc)?;
+            let mut market = Market::load(market_acc, program_id)?;
+            check_assert!(market.prune_authority() == Some(prune_auth_acc.key))?;
+            let _open_orders = market.load_orders_mut(
+                open_orders_acc,
+                Some(open_orders_owner_acc),
+                program_id,
+                Some(Rent::get()?),
+                None,
+            )?;
+            let mut bids = market.load_bids_mut(bids_acc).or(check_unreachable!())?;
+            let mut asks = market.load_asks_mut(asks_acc).or(check_unreachable!())?;
+            let order_book_state = OrderBookState {
+                bids: bids.deref_mut(),
+                asks: asks.deref_mut(),
+                market_state: market.deref_mut(),
+            };
+
+            let args = PruneArgs {
+                order_book_state,
+                open_orders: open_orders_acc.key,
+            };
+            f(args)
+        }
+    }
 }
 
 #[inline]
@@ -2329,6 +2395,11 @@ impl State {
                     Self::process_init_open_orders,
                 )?
             }
+            MarketInstruction::Prune => account_parser::PruneArgs::with_parsed_args(
+                program_id,
+                accounts,
+                Self::process_prune,
+            )?,
         };
         Ok(())
     }
@@ -2336,6 +2407,16 @@ impl State {
     #[cfg(feature = "program")]
     fn process_send_take(_args: account_parser::SendTakeArgs) -> DexResult {
         unimplemented!()
+    }
+
+    fn process_prune(args: account_parser::PruneArgs) -> DexResult {
+        let account_parser::PruneArgs {
+            mut order_book_state,
+            open_orders,
+        } = args;
+        order_book_state
+            .prune(open_orders.to_aligned_bytes())
+            .map(|_| ())
     }
 
     fn process_init_open_orders(_args: account_parser::InitOpenOrdersArgs) -> DexResult {
@@ -2850,6 +2931,7 @@ impl State {
         let pc_vault = args.pc_vault_and_mint.get_account().inner();
         let pc_mint = args.pc_vault_and_mint.get_mint().inner();
         let market_authority = args.market_authority;
+        let prune_authority = args.prune_authority;
 
         // initialize request queue
         let mut rq_data = req_q.try_borrow_mut_data()?;
@@ -2940,6 +3022,8 @@ impl State {
                     try_from_bytes_mut(cast_slice_mut(market_view)).or(check_unreachable!())?;
                 (*market_hdr).inner = market_state;
                 (*market_hdr).authority = *oo_auth.key;
+                (*market_hdr).prune_authority =
+                    prune_authority.map(|p| *p.key).unwrap_or(Pubkey::default());
             }
         }
         Ok(())
